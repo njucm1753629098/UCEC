@@ -2,7 +2,6 @@
 
 This repository provides a runnable implementation of the UCEC model for traditional Chinese medicine repositioning. The code trains a relation-aware graph neural network, retrieves mechanistic evidence chains, refines herb-disease prediction scores, estimates prediction uncertainty, and exports readable prediction tables.
 
-Only source code and required graph input data are included. Trained model weights, training logs, prediction outputs, network pharmacology results, manuscript files, and intermediate exploratory files are intentionally not included.
 
 ## Repository Structure
 
@@ -131,17 +130,3 @@ python ucec/scripts/export_readable_predictions.py \
   --run_dir outputs/runs/seed_1 \
   --device cuda
 ```
-
-### 5. Optional Case Screening
-
-```bash
-python ucec/scripts/screen_case_candidates_final.py \
-  --predictions outputs/runs/seed_1/readable_all_predictions_with_chains.csv \
-  --out_dir outputs/case_screening
-```
-
-## Notes
-
-- All generated outputs are written under `outputs/` and are ignored by Git.
-- This repository does not include pretrained weights. Running the scripts above will train models from the included input data.
-- The implementation focuses on the UCEC model pipeline. Network pharmacology analysis files and manuscript preparation scripts are not included.
