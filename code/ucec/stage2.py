@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import copy
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -163,7 +164,20 @@ class PerturbConfig:
     p_drop_gamma: float = 2.0
     lambda_sigma: float = 0.5
     aggregation_budget: int = 30
-    use_evidence_only_gate: bool = True
+    use_evidence_only_gate: bool = False
+
+
+@dataclass
+class Stage2TrainConfig:
+    max_epochs: int = 200
+    batch_size: int = 64
+    lr: float = 1e-3
+    weight_decay: float = 1e-5
+    print_every: int = 1
+    patience: int = 20
+    min_delta: float = 1e-4
+    monitor_fraction: float = 0.25
+    seed: int = 1
 
 
 class EdgeGate(nn.Module):
@@ -201,8 +215,7 @@ def _masked_softmax_grouped(logits: torch.Tensor, group_ptr: torch.LongTensor, k
             continue
         l = logits[s:e].clone()
         l[~m] = -1e9
-        p = torch.softmax(l, dim=0)
-        p[~m] = 0.0
+        p = torch.softmax(l, dim=0) * m.to(logits.dtype)
         out[s:e] = p
     return out
 
@@ -232,41 +245,53 @@ class UCECEvidenceScorer:
         self.gate = EdgeGate(node_dim=self.z.shape[1], rel_names_forward=self.rel_forward, cfg=pert_cfg).to(self.device)
 
         self.ev_index = EvidenceIndex(run, retr_cfg)
+        self._pair_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    def compute_pair_evidence(self, herb: str, disease: str) -> PairEvidenceResult:
-        chains = self.ev_index.retrieve_chains(herb, disease)
+    def _prepare_pair(self, herb: str, disease: str) -> Optional[Dict[str, Any]]:
+        key_hd = (str(herb), str(disease))
+        if key_hd in self._pair_cache:
+            return self._pair_cache[key_hd]
+
+        chains = self.ev_index.retrieve_chains(str(herb), str(disease))
         if not chains:
-            return PairEvidenceResult(E=0.0, U=1.0, top_chains=[])
+            self._pair_cache[key_hd] = None
+            return None
 
-        # Union edges across chains
         edge_map: Dict[Tuple[int, int, str], int] = {}
         edge_src: List[int] = []
         edge_dst: List[int] = []
         edge_rel: List[str] = []
         edge_ev: List[float] = []
-
         chain_edge_ids: List[List[int]] = []
+
         for c in chains:
             ids = []
             for (rel, si, ti), ev in zip(c.edges, c.edge_evidence):
-                sg = c.nodes_g[si]; tg = c.nodes_g[ti]
+                sg = c.nodes_g[si]
+                tg = c.nodes_g[ti]
                 k = (int(sg), int(tg), rel)
                 if k not in edge_map:
                     edge_map[k] = len(edge_src)
-                    edge_src.append(int(sg)); edge_dst.append(int(tg)); edge_rel.append(rel); edge_ev.append(float(ev))
+                    edge_src.append(int(sg))
+                    edge_dst.append(int(tg))
+                    edge_rel.append(rel)
+                    edge_ev.append(float(ev))
                 ids.append(edge_map[k])
             chain_edge_ids.append(ids)
 
-        rel_ids = torch.tensor([self.gate.rel2id[r] for r in edge_rel], dtype=torch.long, device=self.device)
-        src_t = torch.tensor(edge_src, dtype=torch.long, device=self.device)
-        dst_t = torch.tensor(edge_dst, dtype=torch.long, device=self.device)
-        ev_t = torch.tensor(edge_ev, dtype=torch.float32, device=self.device)
+        rel_ids = torch.tensor([self.gate.rel2id[r] for r in edge_rel], dtype=torch.long)
+        src_t = torch.tensor(edge_src, dtype=torch.long)
+        dst_t = torch.tensor(edge_dst, dtype=torch.long)
+        ev_t = torch.tensor(edge_ev, dtype=torch.float32)
 
         order = torch.argsort(src_t * 100 + rel_ids)
-        src_t = src_t[order]; dst_t = dst_t[order]; rel_ids = rel_ids[order]; ev_t = ev_t[order]
+        src_t = src_t[order]
+        dst_t = dst_t[order]
+        rel_ids = rel_ids[order]
+        ev_t = ev_t[order]
 
         inv = torch.empty_like(order)
-        inv[order] = torch.arange(order.numel(), device=self.device)
+        inv[order] = torch.arange(order.numel())
         chain_edge_ids_sorted = [[int(inv[i].item()) for i in ids] for ids in chain_edge_ids]
 
         key = torch.stack([src_t, rel_ids], dim=1).detach().cpu().numpy()
@@ -275,7 +300,62 @@ class UCECEvidenceScorer:
             if key[i, 0] != key[i - 1, 0] or key[i, 1] != key[i - 1, 1]:
                 group_ptr.append(i)
         group_ptr.append(len(key))
-        group_ptr = torch.tensor(group_ptr, dtype=torch.long, device=self.device)
+
+        prepared = {
+            "chains": chains,
+            "src_t": src_t.cpu(),
+            "dst_t": dst_t.cpu(),
+            "rel_ids": rel_ids.cpu(),
+            "ev_t": ev_t.cpu(),
+            "group_ptr": torch.tensor(group_ptr, dtype=torch.long),
+            "chain_edge_ids_sorted": chain_edge_ids_sorted,
+        }
+        self._pair_cache[key_hd] = prepared
+        return prepared
+
+    def compute_pair_evidence_expected(self, herb: str, disease: str) -> torch.Tensor:
+        prepared = self._prepare_pair(herb, disease)
+        if prepared is None:
+            return torch.zeros((), dtype=torch.float32, device=self.device)
+
+        src_t = prepared["src_t"].to(self.device)
+        dst_t = prepared["dst_t"].to(self.device)
+        rel_ids = prepared["rel_ids"].to(self.device)
+        ev_t = prepared["ev_t"].to(self.device)
+        group_ptr = prepared["group_ptr"].to(self.device)
+        chain_edge_ids_sorted = prepared["chain_edge_ids_sorted"]
+
+        z_src = self.z[src_t]
+        z_dst = self.z[dst_t]
+        logits = self.gate.forward_logits(z_src, z_dst, rel_ids, ev_t)
+        keep = torch.ones_like(ev_t, dtype=torch.bool)
+        alpha = _masked_softmax_grouped(logits, group_ptr, keep)
+        ctilde = torch.clamp(alpha * ev_t, min=0.0)
+
+        chain_scores = []
+        for ids in chain_edge_ids_sorted:
+            if not ids:
+                chain_scores.append(torch.zeros((), dtype=torch.float32, device=self.device))
+            else:
+                chain_scores.append(ctilde[torch.tensor(ids, device=self.device)].sum())
+        scores = torch.stack(chain_scores)
+        agg = min(int(self.pert_cfg.aggregation_budget), int(scores.numel()))
+        if agg <= 0:
+            return torch.zeros((), dtype=torch.float32, device=self.device)
+        top_scores, _ = torch.topk(scores, k=agg)
+        return top_scores.mean()
+
+    def compute_pair_evidence(self, herb: str, disease: str) -> PairEvidenceResult:
+        prepared = self._prepare_pair(herb, disease)
+        if prepared is None:
+            return PairEvidenceResult(E=0.0, U=1.0, top_chains=[])
+        chains = prepared["chains"]
+        src_t = prepared["src_t"].to(self.device)
+        dst_t = prepared["dst_t"].to(self.device)
+        rel_ids = prepared["rel_ids"].to(self.device)
+        ev_t = prepared["ev_t"].to(self.device)
+        group_ptr = prepared["group_ptr"].to(self.device)
+        chain_edge_ids_sorted = prepared["chain_edge_ids_sorted"]
 
         self.gate.train()
         z_src = self.z[src_t]
@@ -389,3 +469,100 @@ def fit_calibrator(
         loss.backward()
         opt.step()
     return model
+
+
+def fit_stage2_posterior(
+    scorer: UCECEvidenceScorer,
+    s0corr: np.ndarray,
+    herbs: List[str],
+    diseases: List[str],
+    y: np.ndarray,
+    cfg: Stage2TrainConfig,
+    device: str = "cpu",
+) -> Tuple[LogisticCalibrator, Dict[str, List[float]]]:
+    dev = torch.device(device)
+    scorer.gate = scorer.gate.to(dev)
+    scorer.device = dev
+    scorer.z = scorer.z.to(dev)
+
+    calib = LogisticCalibrator().to(dev)
+    params = list(scorer.gate.parameters()) + list(calib.parameters())
+    opt = torch.optim.Adam(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    history: Dict[str, List[float]] = {"train_bce": [], "monitor_bce": []}
+
+    s0_t = torch.tensor(s0corr, dtype=torch.float32, device=dev)
+    y_t = torch.tensor(y, dtype=torch.float32, device=dev)
+    n = len(herbs)
+    rng = np.random.default_rng(cfg.seed)
+    all_idx = np.arange(n)
+    rng.shuffle(all_idx)
+    n_monitor = int(round(n * float(cfg.monitor_fraction)))
+    n_monitor = min(max(n_monitor, 1), max(n - 1, 1))
+    monitor_idx = all_idx[:n_monitor]
+    train_idx = all_idx[n_monitor:] if n > 1 else all_idx
+    if train_idx.size == 0:
+        train_idx = all_idx
+    order = train_idx.copy()
+    best_monitor = float("inf")
+    best_epoch = 0
+    best_gate_state = None
+    best_calib_state = None
+    wait = 0
+
+    for epoch in range(1, cfg.max_epochs + 1):
+        rng.shuffle(order)
+        scorer.gate.train()
+        calib.train()
+        losses: List[float] = []
+        for start in range(0, len(order), cfg.batch_size):
+            batch_idx = order[start : start + cfg.batch_size]
+            opt.zero_grad(set_to_none=True)
+            e_vals = []
+            for i in batch_idx:
+                e_vals.append(scorer.compute_pair_evidence_expected(herbs[i], diseases[i]))
+            E_batch = torch.stack(e_vals)
+            p = calib(s0_t[batch_idx], E_batch)
+            loss = torch.nn.functional.binary_cross_entropy(p, y_t[batch_idx])
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.detach().cpu().item()))
+        mean_loss = float(np.mean(losses)) if losses else float("nan")
+        history["train_bce"].append(mean_loss)
+
+        scorer.gate.eval()
+        calib.eval()
+        with torch.no_grad():
+            monitor_e = torch.stack([scorer.compute_pair_evidence_expected(herbs[i], diseases[i]) for i in monitor_idx])
+            monitor_p = calib(s0_t[monitor_idx], monitor_e)
+            monitor_loss = torch.nn.functional.binary_cross_entropy(monitor_p, y_t[monitor_idx])
+            monitor_bce = float(monitor_loss.detach().cpu().item())
+        history["monitor_bce"].append(monitor_bce)
+
+        improved = monitor_bce < best_monitor - float(cfg.min_delta)
+        if improved:
+            best_monitor = monitor_bce
+            best_epoch = epoch
+            best_gate_state = copy.deepcopy(scorer.gate.state_dict())
+            best_calib_state = copy.deepcopy(calib.state_dict())
+            wait = 0
+        else:
+            wait += 1
+
+        if epoch == 1 or epoch % max(int(cfg.print_every), 1) == 0 or improved or wait >= cfg.patience:
+            suffix = " *best" if improved else f" no_improve={wait}/{cfg.patience}"
+            print(
+                f"[stage2:train] epoch {epoch}/{cfg.max_epochs} "
+                f"train_bce={mean_loss:.6f} monitor_bce={monitor_bce:.6f}{suffix}",
+                flush=True,
+            )
+        if wait >= cfg.patience:
+            print(f"[stage2:train] early stop at epoch {epoch}; best_epoch={best_epoch} monitor_bce={best_monitor:.6f}", flush=True)
+            break
+
+    if best_gate_state is not None:
+        scorer.gate.load_state_dict(best_gate_state)
+    if best_calib_state is not None:
+        calib.load_state_dict(best_calib_state)
+    history["best_epoch"] = [float(best_epoch)]
+    history["best_monitor_bce"] = [float(best_monitor)]
+    return calib.eval(), history

@@ -22,6 +22,8 @@ class TrainConfig:
     lr: float = 2e-3
     weight_decay: float = 0.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    verbose: bool = True
+    print_every: int = 1
 
 
 def _collect_nodes_by_type(run: RunGraph) -> Dict[str, np.ndarray]:
@@ -134,6 +136,7 @@ def train_gnn_model(
     cfg: TrainConfig,
     seed: int,
     use_rel_types_in_encoder: bool,
+    model_name: str = "gnn",
 ) -> Dict[str, List[float]]:
     device = torch.device(cfg.device)
     model = model.to(device)
@@ -181,8 +184,68 @@ def train_gnn_model(
 
         total_loss.backward()
         opt.step()
-        logs["loss"].append(float(total_loss.detach().cpu().item()))
+        epoch_loss = float(total_loss.detach().cpu().item())
+        logs["loss"].append(epoch_loss)
+        if cfg.verbose and (epoch == 1 or epoch % max(int(cfg.print_every), 1) == 0 or epoch == cfg.epochs):
+            print(f"[stage1:{model_name}] epoch {epoch}/{cfg.epochs} loss={epoch_loss:.6f}", flush=True)
     return logs
+
+
+def train_gnn_one_epoch(
+    run: RunGraph,
+    model,
+    rel_name_to_full_id: Dict[str, int],
+    cfg: TrainConfig,
+    seed: int,
+    epoch: int,
+    opt,
+    sampler: Optional[TypeAwareNegativeSampler] = None,
+    use_rel_types_in_encoder: bool = True,
+) -> float:
+    device = torch.device(cfg.device)
+    model = model.to(device)
+    model.train()
+
+    rel_train = _rel_train_arrays(run)
+    if sampler is None:
+        sampler = TypeAwareNegativeSampler(run, seed=seed + 999)
+
+    edge_index = run.train.edge_index.to(device)
+    edge_type = run.train.edge_type.to(device)
+
+    opt.zero_grad(set_to_none=True)
+
+    if use_rel_types_in_encoder:
+        z = model.encode(edge_index=edge_index, edge_type=edge_type)
+    else:
+        z = model.encode(edge_index=edge_index)
+
+    total_loss = 0.0
+    rel_names = list(rel_train.keys())
+    for step in range(cfg.steps_per_epoch):
+        rel = rel_names[step % len(rel_names)]
+        h_all, t_all = rel_train[rel]
+        if len(h_all) == 0:
+            continue
+        idxs = np.random.default_rng(seed + epoch * 13 + step).integers(0, len(h_all), size=cfg.batch_pos)
+        h_pos = h_all[idxs]
+        t_pos = t_all[idxs]
+        h_neg, t_neg = sampler.sample(rel, h_pos, t_pos, n_neg_per_pos=cfg.neg_per_pos)
+
+        h = torch.from_numpy(np.concatenate([h_pos, h_neg])).long().to(device)
+        t = torch.from_numpy(np.concatenate([t_pos, t_neg])).long().to(device)
+        y = torch.from_numpy(np.concatenate([np.ones_like(h_pos), np.zeros_like(h_neg)])).float().to(device)
+
+        rel_id = rel_name_to_full_id[rel]
+        rel_ids = torch.full((h.shape[0],), rel_id, dtype=torch.long, device=device)
+
+        logits = model.score_logits_all_rel(z, rel_ids, h, t)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        total_loss = total_loss + loss
+
+    total_loss.backward()
+    opt.step()
+    return float(total_loss.detach().cpu().item())
 
 
 @torch.no_grad()
@@ -247,6 +310,7 @@ def train_kge(
     rel_name_to_full_id: Dict[str, int],
     cfg: TrainConfig,
     seed: int,
+    model_name: str = "kge",
 ) -> Dict[str, List[float]]:
     device = torch.device(cfg.device)
     model = model.to(device)
@@ -285,7 +349,10 @@ def train_kge(
             opt.step()
 
             total_loss += float(loss.detach().cpu().item())
-        logs["loss"].append(total_loss / max(cfg.steps_per_epoch, 1))
+        epoch_loss = total_loss / max(cfg.steps_per_epoch, 1)
+        logs["loss"].append(epoch_loss)
+        if cfg.verbose and (epoch == 1 or epoch % max(int(cfg.print_every), 1) == 0 or epoch == cfg.epochs):
+            print(f"[stage1:{model_name}] epoch {epoch}/{cfg.epochs} loss={epoch_loss:.6f}", flush=True)
     return logs
 
 

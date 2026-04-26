@@ -17,14 +17,16 @@ def _need(path: str) -> None:
         raise FileNotFoundError(f"Missing input file: {path}")
 
 
-def _scale01_with_train(train_vals: np.ndarray, vals: np.ndarray) -> np.ndarray:
+def _scale01_with_train(train_vals: np.ndarray, vals: np.ndarray, floor: float = 1e-3) -> np.ndarray:
     train_vals = np.asarray(train_vals, dtype=float)
     vals = np.asarray(vals, dtype=float)
     mn = float(np.min(train_vals)) if train_vals.size else 0.0
     mx = float(np.max(train_vals)) if train_vals.size else 1.0
     if mx - mn < 1e-12:
-        return np.zeros_like(vals, dtype=float)
-    return (vals - mn) / (mx - mn)
+        return np.full_like(vals, fill_value=float(floor), dtype=float)
+    scaled = (vals - mn) / (mx - mn)
+    scaled = np.clip(scaled, 0.0, 1.0)
+    return np.clip(scaled, float(floor), 1.0)
 
 
 def split_edges(df: pd.DataFrame, seed: int, ratios=(0.8, 0.1, 0.1)) -> Dict[str, pd.DataFrame]:
@@ -208,6 +210,7 @@ def load_raw_relations(data_dir: str, files: Optional[Dict[str, str]] = None) ->
 class SplitRelations:
     edges: Dict[str, Dict[str, pd.DataFrame]]
     evidence_scalers: Dict[str, Dict[str, float]]
+    meta: Dict[str, str]
 
 
 def make_splits_and_derived_edges(

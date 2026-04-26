@@ -4,30 +4,44 @@ import random
 from typing import Dict, Iterable, List
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    p = torch.clamp(p, eps, 1 - eps)
-    return torch.log(p) - torch.log1p(-p)
+def logit(p, eps: float = 1e-6):
+    if torch is not None and hasattr(p, "dtype"):
+        p = torch.clamp(p, eps, 1 - eps)
+        return torch.log(p) - torch.log1p(-p)
+    p = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)
+    return np.log(p) - np.log1p(-p)
 
 
 def auroc_auprc(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, float]:
-    from sklearn.metrics import roc_auc_score, average_precision_score
+    from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, precision_recall_fscore_support
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score).astype(float)
+    y_pred = (y_score >= 0.5).astype(int)
     out: Dict[str, float] = {}
     out["auroc"] = float(roc_auc_score(y_true, y_score)) if len(np.unique(y_true)) > 1 else float("nan")
     out["auprc"] = float(average_precision_score(y_true, y_score)) if y_true.sum() > 0 else 0.0
+    out["accuracy"] = float(accuracy_score(y_true, y_pred))
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    out["precision"] = float(precision)
+    out["recall"] = float(recall)
+    out["f1"] = float(f1)
     return out
 
 

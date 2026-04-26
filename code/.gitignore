@@ -1,0 +1,42 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated model artifacts and experiment outputs
+outputs/*
+!outputs/.gitkeep
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+
+# Generated prediction/export files
+*.log
+*_metrics.json
+stage1_metrics.json
+stage2_training.json
+proxy_*.csv
+predictions_*.csv
+prediction_*.csv
+readable_*.csv
+readable_*.xlsx
+table_*.csv
+deletion_test.csv
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
