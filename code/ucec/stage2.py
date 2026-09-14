@@ -22,6 +22,8 @@ class RetrievalConfig:
     max_path_per_prot: int = 20
     retrieval_budget: int = 100
     use_ppi_hop: bool = False
+    max_ppi_hops: int = 1
+    ppi_walk_beam: int = 100
 
 
 @dataclass
@@ -61,6 +63,9 @@ class EvidenceIndex:
         for p, g in ppi.groupby("protein"):
             gg = g.sort_values("evidence", ascending=False).head(cfg.ppi_topk)
             self.prot_to_ppi[str(p)] = list(zip(gg["protein2"].astype(str).tolist(), gg["evidence"].astype(float).tolist()))
+        self._ppi_walk_cache: Dict[
+            Tuple[str, int, int], Dict[int, List[Tuple[Tuple[str, ...], Tuple[float, ...]]]]
+        ] = {}
 
         self.prot_to_path: Dict[str, List[str]] = {}
         for p, g in ppath.groupby("protein"):
@@ -69,10 +74,90 @@ class EvidenceIndex:
         # Evidence lookups
         self.pd_ev: Dict[Tuple[str, str], float] = {(r.protein, r.disease): float(r.evidence) for r in pd.itertuples(index=False)}
         self.pathd_ev: Dict[Tuple[str, str], float] = {(r.pathway, r.disease): float(r.evidence) for r in pathd.itertuples(index=False)}
+        self.prot_to_pd_diseases: Dict[str, set[str]] = {}
+        for protein, group in pd.groupby("protein"):
+            self.prot_to_pd_diseases[str(protein)] = set(group["disease"].astype(str))
+        self.path_to_diseases: Dict[str, set[str]] = {}
+        for pathway, group in pathd.groupby("pathway"):
+            self.path_to_diseases[str(pathway)] = set(group["disease"].astype(str))
 
     def _g(self, t: str, rid: str) -> int:
         rid = str(rid)
         return self.idx.offsets[t] + self.idx.id_maps[t][rid]
+
+    def _ppi_walks(
+        self, start: str, max_hops: int
+    ) -> Dict[int, List[Tuple[Tuple[str, ...], Tuple[float, ...]]]]:
+        """Return high-evidence simple PPI walks, grouped by exact hop count."""
+        beam = max(int(self.cfg.ppi_walk_beam), 1)
+        key = (str(start), int(max_hops), beam)
+        cached = self._ppi_walk_cache.get(key)
+        if cached is not None:
+            return cached
+
+        frontier: List[Tuple[Tuple[str, ...], Tuple[float, ...], float]] = [
+            ((str(start),), tuple(), 1.0)
+        ]
+        walks: Dict[int, List[Tuple[Tuple[str, ...], Tuple[float, ...]]]] = {}
+        for depth in range(1, int(max_hops) + 1):
+            candidates: List[Tuple[Tuple[str, ...], Tuple[float, ...], float]] = []
+            for proteins, evidences, score in frontier:
+                for neighbor, evidence in self.prot_to_ppi.get(proteins[-1], []):
+                    neighbor = str(neighbor)
+                    if neighbor in proteins:
+                        continue
+                    evidence = float(evidence)
+                    candidates.append(
+                        (proteins + (neighbor,), evidences + (evidence,), score * evidence)
+                    )
+            candidates.sort(key=lambda item: item[2], reverse=True)
+            frontier = candidates[:beam]
+            walks[depth] = [(proteins[1:], evidences) for proteins, evidences, _ in frontier]
+            if not frontier:
+                break
+
+        self._ppi_walk_cache[key] = walks
+        return walks
+
+    def reachable_diseases(self, herb: str) -> set[str]:
+        """Return diseases for which ``retrieve_chains`` can produce a chain.
+
+        This follows the same ingredient, target, pathway, PPI-neighbour and
+        beam limits as retrieval. It is used to avoid expensive stochastic
+        scoring for the remaining disease universe, where E and U are zero.
+        """
+        cfg = self.cfg
+        ingredients = self.herb_to_ing.get(str(herb), [])[: cfg.max_ing_per_herb]
+        if not ingredients:
+            return set()
+
+        start_proteins: set[str] = set()
+        for ingredient in ingredients:
+            targets = self.ing_to_prot.get(str(ingredient))
+            if targets is None:
+                continue
+            start_proteins.update(targets["protein"].astype(str).tolist())
+
+        endpoints = set(start_proteins)
+        max_ppi_hops = max(int(cfg.max_ppi_hops), 1) if cfg.use_ppi_hop else 0
+        if max_ppi_hops >= 1:
+            for protein in start_proteins:
+                endpoints.update(
+                    str(neighbor)
+                    for neighbor, _ in self.prot_to_ppi.get(protein, [])[: cfg.ppi_topk]
+                )
+        if max_ppi_hops >= 2:
+            for protein in start_proteins:
+                walks = self._ppi_walks(protein, max_ppi_hops)
+                for hop_count in range(2, max_ppi_hops + 1):
+                    endpoints.update(walk[-1] for walk, _ in walks.get(hop_count, []))
+
+        diseases: set[str] = set()
+        for protein in endpoints:
+            diseases.update(self.prot_to_pd_diseases.get(protein, set()))
+            for pathway in self.prot_to_path.get(protein, [])[: cfg.max_path_per_prot]:
+                diseases.update(self.path_to_diseases.get(str(pathway), set()))
+        return diseases
 
     def retrieve_chains(self, herb: str, disease: str) -> List[Chain]:
         cfg = self.cfg
@@ -120,7 +205,8 @@ class EvidenceIndex:
                     evs = [1.0, ev_ip, 1.0, float(ev_pathd)]
                     add_chain(nodes, edges, evs)
 
-        if cfg.use_ppi_hop:
+        max_ppi_hops = max(int(cfg.max_ppi_hops), 1) if cfg.use_ppi_hop else 0
+        if max_ppi_hops >= 1:
             for ing, g in ip.groupby("ingredient"):
                 gg = g.sort_values("evidence", ascending=False).head(cfg.max_prot_per_ing)
                 for row in gg.itertuples(index=False):
@@ -150,6 +236,51 @@ class EvidenceIndex:
                             evs = [1.0, ev_ip, float(ev_ppi), 1.0, float(ev_pathd)]
                             add_chain(nodes, edges, evs)
 
+        if max_ppi_hops >= 2:
+            for ing, g in ip.groupby("ingredient"):
+                gg = g.sort_values("evidence", ascending=False).head(cfg.max_prot_per_ing)
+                for row in gg.itertuples(index=False):
+                    p1 = str(row.protein)
+                    ev_ip = float(row.evidence)
+                    walks = self._ppi_walks(p1, max_ppi_hops)
+                    for hop_count in range(2, max_ppi_hops + 1):
+                        for proteins, ppi_evs in walks.get(hop_count, []):
+                            endpoint = proteins[-1]
+                            prefix_nodes = [
+                                ("herb", herb),
+                                ("ingredient", str(ing)),
+                                ("protein", p1),
+                            ] + [("protein", protein) for protein in proteins]
+                            prefix_edges = [("HI", 0, 1), ("IP", 1, 2)] + [
+                                ("PPi", 2 + idx, 3 + idx)
+                                for idx in range(len(proteins))
+                            ]
+                            prefix_evs = [1.0, ev_ip] + [float(value) for value in ppi_evs]
+
+                            ev_pd = self.pd_ev.get((endpoint, disease))
+                            if ev_pd is not None:
+                                disease_idx = len(prefix_nodes)
+                                add_chain(
+                                    prefix_nodes + [("disease", disease)],
+                                    prefix_edges + [("PD", disease_idx - 1, disease_idx)],
+                                    prefix_evs + [float(ev_pd)],
+                                )
+
+                            for path in self.prot_to_path.get(endpoint, [])[: cfg.max_path_per_prot]:
+                                ev_pathd = self.pathd_ev.get((str(path), disease))
+                                if ev_pathd is None:
+                                    continue
+                                path_idx = len(prefix_nodes)
+                                add_chain(
+                                    prefix_nodes + [("pathway", str(path)), ("disease", disease)],
+                                    prefix_edges
+                                    + [
+                                        ("PPath", path_idx - 1, path_idx),
+                                        ("PathD", path_idx, path_idx + 1),
+                                    ],
+                                    prefix_evs + [1.0, float(ev_pathd)],
+                                )
+
         chains.sort(key=lambda c: c.pre_score, reverse=True)
         return chains[: cfg.retrieval_budget]
 
@@ -165,6 +296,9 @@ class PerturbConfig:
     lambda_sigma: float = 0.5
     aggregation_budget: int = 30
     use_evidence_only_gate: bool = False
+    # Controls used for the reviewer-requested perturbation ablation.
+    # ``full`` preserves the original evidence-guided MC-dropout procedure.
+    perturb_mode: str = "full"
 
 
 @dataclass
@@ -202,22 +336,37 @@ class EdgeGate(nn.Module):
         return self.mlp(x).squeeze(-1)
 
 
-def _masked_softmax_grouped(logits: torch.Tensor, group_ptr: torch.LongTensor, keep: torch.Tensor) -> torch.Tensor:
-    out = torch.zeros_like(logits)
+def _masked_softmax_grouped(
+    logits: torch.Tensor,
+    group_ptr: torch.LongTensor,
+    keep: torch.Tensor,
+    group_ids: Optional[torch.LongTensor] = None,
+) -> torch.Tensor:
+    """Softmax over sorted groups, with masked entries removed.
+
+    The previous implementation launched a Python loop and a separate GPU
+    reduction for every group. The scatter formulation is mathematically
+    equivalent and is important for the full reviewer-control run, which
+    evaluates millions of small grouped softmaxes.
+    """
     G = group_ptr.numel() - 1
-    for g in range(G):
-        s = int(group_ptr[g].item())
-        e = int(group_ptr[g + 1].item())
-        if e <= s:
-            continue
-        m = keep[s:e]
-        if not torch.any(m):
-            continue
-        l = logits[s:e].clone()
-        l[~m] = -1e9
-        p = torch.softmax(l, dim=0) * m.to(logits.dtype)
-        out[s:e] = p
-    return out
+    if G <= 0 or logits.numel() == 0:
+        return torch.zeros_like(logits)
+    if group_ids is None:
+        lengths = group_ptr[1:] - group_ptr[:-1]
+        group_ids = torch.repeat_interleave(torch.arange(G, device=logits.device), lengths)
+    else:
+        group_ids = group_ids.to(logits.device)
+
+    neg_large = torch.full_like(logits, -1e9)
+    masked_logits = torch.where(keep, logits, neg_large)
+    group_max = torch.full((G,), -1e9, dtype=logits.dtype, device=logits.device)
+    group_max.scatter_reduce_(0, group_ids, masked_logits, reduce="amax", include_self=True)
+    exp_logits = torch.exp(masked_logits - group_max[group_ids]) * keep.to(logits.dtype)
+    group_sum = torch.zeros((G,), dtype=logits.dtype, device=logits.device)
+    group_sum.scatter_add_(0, group_ids, exp_logits)
+    denom = group_sum[group_ids]
+    return torch.where(denom > 0, exp_logits / torch.clamp(denom, min=1e-12), torch.zeros_like(exp_logits))
 
 
 def evidence_guided_dropout_prob(evidence: torch.Tensor, cfg: PerturbConfig) -> torch.Tensor:
@@ -308,6 +457,10 @@ class UCECEvidenceScorer:
             "rel_ids": rel_ids.cpu(),
             "ev_t": ev_t.cpu(),
             "group_ptr": torch.tensor(group_ptr, dtype=torch.long),
+            "group_ids": torch.repeat_interleave(
+                torch.arange(len(group_ptr) - 1, dtype=torch.long),
+                torch.tensor(np.diff(group_ptr), dtype=torch.long),
+            ),
             "chain_edge_ids_sorted": chain_edge_ids_sorted,
         }
         self._pair_cache[key_hd] = prepared
@@ -323,13 +476,14 @@ class UCECEvidenceScorer:
         rel_ids = prepared["rel_ids"].to(self.device)
         ev_t = prepared["ev_t"].to(self.device)
         group_ptr = prepared["group_ptr"].to(self.device)
+        group_ids = prepared["group_ids"].to(self.device)
         chain_edge_ids_sorted = prepared["chain_edge_ids_sorted"]
 
         z_src = self.z[src_t]
         z_dst = self.z[dst_t]
         logits = self.gate.forward_logits(z_src, z_dst, rel_ids, ev_t)
         keep = torch.ones_like(ev_t, dtype=torch.bool)
-        alpha = _masked_softmax_grouped(logits, group_ptr, keep)
+        alpha = _masked_softmax_grouped(logits, group_ptr, keep, group_ids)
         ctilde = torch.clamp(alpha * ev_t, min=0.0)
 
         chain_scores = []
@@ -345,6 +499,7 @@ class UCECEvidenceScorer:
         top_scores, _ = torch.topk(scores, k=agg)
         return top_scores.mean()
 
+    @torch.no_grad()
     def compute_pair_evidence(self, herb: str, disease: str) -> PairEvidenceResult:
         prepared = self._prepare_pair(herb, disease)
         if prepared is None:
@@ -355,19 +510,50 @@ class UCECEvidenceScorer:
         rel_ids = prepared["rel_ids"].to(self.device)
         ev_t = prepared["ev_t"].to(self.device)
         group_ptr = prepared["group_ptr"].to(self.device)
+        group_ids = prepared["group_ids"].to(self.device)
         chain_edge_ids_sorted = prepared["chain_edge_ids_sorted"]
 
-        self.gate.train()
+        mode = str(self.pert_cfg.perturb_mode).lower()
+        valid_modes = {"full", "uniform", "shuffled_evidence", "relation_fixed", "mc_only", "evidence_only"}
+        if mode not in valid_modes:
+            raise ValueError(f"Unknown perturb_mode={self.pert_cfg.perturb_mode!r}; expected one of {sorted(valid_modes)}")
+
+        # The controls keep the trained gate and retrieved chains fixed. Only
+        # the source of stochasticity is changed, which isolates the role of
+        # evidence-guided deletion in the uncertainty estimate.
+        if mode == "evidence_only":
+            self.gate.eval()
+        else:
+            self.gate.train()
         z_src = self.z[src_t]
         z_dst = self.z[dst_t]
-        p_drop = evidence_guided_dropout_prob(ev_t, self.pert_cfg)
+        p_drop_full = evidence_guided_dropout_prob(ev_t, self.pert_cfg)
+        if mode == "full" or mode == "evidence_only":
+            p_drop = p_drop_full
+        elif mode == "mc_only":
+            p_drop = torch.zeros_like(p_drop_full)
+        elif mode == "uniform":
+            p_drop = torch.full_like(p_drop_full, float(p_drop_full.mean().item()))
+        elif mode == "relation_fixed":
+            p_drop = torch.zeros_like(p_drop_full)
+            for rid in torch.unique(rel_ids):
+                mask = rel_ids == rid
+                p_drop[mask] = p_drop_full[mask].mean()
+        else:  # shuffled_evidence
+            shuffled = ev_t.clone()
+            for rid in torch.unique(rel_ids):
+                mask = rel_ids == rid
+                idx = torch.where(mask)[0]
+                if idx.numel() > 1:
+                    shuffled[idx] = ev_t[idx[torch.randperm(idx.numel(), device=idx.device)]]
+            p_drop = evidence_guided_dropout_prob(shuffled, self.pert_cfg)
 
         T = int(self.pert_cfg.mc_samples)
         contrib = torch.zeros((T, src_t.numel()), dtype=torch.float32, device=self.device)
         for t in range(T):
             keep = torch.rand_like(p_drop) > p_drop
             logits_t = self.gate.forward_logits(z_src, z_dst, rel_ids, ev_t)
-            contrib[t] = _masked_softmax_grouped(logits_t, group_ptr, keep)
+            contrib[t] = _masked_softmax_grouped(logits_t, group_ptr, keep, group_ids)
 
         mu = contrib.mean(dim=0)
         sigma = contrib.std(dim=0, unbiased=False)

@@ -330,6 +330,8 @@ def main():
     ap.add_argument("--neg_per_herb", type=int, default=16)
     # retrieval/scoring
     ap.add_argument("--use_ppi_hop", action="store_true")
+    ap.add_argument("--max_ppi_hops", type=int, default=1)
+    ap.add_argument("--ppi_walk_beam", type=int, default=100)
     ap.add_argument("--mc_samples", type=int, default=16)
     ap.add_argument("--retrieval_budget", type=int, default=100)
     ap.add_argument("--aggregation_budget", type=int, default=30)
@@ -341,6 +343,11 @@ def main():
     ap.add_argument("--stage2_train_batch_size", type=int, default=64)
     ap.add_argument("--stage2_train_lr", type=float, default=1e-3)
     ap.add_argument("--stage2_print_every", type=int, default=1)
+    ap.add_argument(
+        "--skip_initial_evidence",
+        action="store_true",
+        help="Compute only fixed global priors before stage-2 fitting; evidence is recomputed after fitting.",
+    )
     ap.add_argument("--evidence_only_gate", action="store_true")
     ap.add_argument("--export_full_predictions", action="store_true")
     ap.add_argument("--full_shortlist_per_herb", type=int, default=200)
@@ -367,6 +374,8 @@ def main():
         max_path_per_prot=20,
         retrieval_budget=args.retrieval_budget,
         use_ppi_hop=args.use_ppi_hop,
+        max_ppi_hops=args.max_ppi_hops,
+        ppi_walk_beam=args.ppi_walk_beam,
     )
     pert_cfg = PerturbConfig(
         mc_samples=args.mc_samples,
@@ -412,8 +421,28 @@ def main():
                 topchains.append({"herb": h, "disease": d, "top_chains": res.top_chains})
         return s0, s0corr, E, U, y, topchains
 
-    s0_v, s0c_v, E_v, U_v, y_v, expl_v = compute_features(bench_val, "val")
-    s0_t, s0c_t, E_t, U_t, y_t, expl_t = compute_features(bench_test, "test")
+    def compute_priors(df: pd.DataFrame):
+        herbs = df["herb"].astype(str).tolist()
+        diseases = df["disease"].astype(str).tolist()
+        y = df["label"].astype(int).to_numpy()
+        h_idx = torch.tensor(
+            [_global_index(run, "herb", h) for h in herbs], dtype=torch.long, device=z.device
+        )
+        d_idx = torch.tensor(
+            [_global_index(run, "disease", d) for d in diseases], dtype=torch.long, device=z.device
+        )
+        with torch.no_grad():
+            logits = torch.sum(z[h_idx] * z[d_idx], dim=-1)
+            s0 = torch.sigmoid(logits).detach().cpu().numpy()
+        s0corr = _apply_global_disease_bias(s0, np.array(diseases, dtype=object), disease_bias)
+        return s0, s0corr, y
+
+    if args.skip_initial_evidence:
+        s0_v, s0c_v, y_v = compute_priors(bench_val)
+        s0_t, s0c_t, y_t = compute_priors(bench_test)
+    else:
+        s0_v, s0c_v, E_v, U_v, y_v, expl_v = compute_features(bench_val, "val")
+        s0_t, s0c_t, E_t, U_t, y_t, expl_t = compute_features(bench_test, "test")
 
     # Train stage-2 posterior on validation proxy pairs.
     stage2_max_epochs = int(args.stage2_train_epochs) if args.stage2_train_epochs is not None else int(args.stage2_max_epochs)
